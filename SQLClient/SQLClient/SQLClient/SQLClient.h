@@ -8,6 +8,11 @@
 
 #import <Foundation/Foundation.h>
 
+NS_ASSUME_NONNULL_BEGIN
+
+typedef void (^SQLQueryResults)(NSArray* _Nullable results, int rowsAffected);
+typedef void (^SQLConnectionSuccess)(BOOL success);
+
 @protocol SQLClientDelegate <NSObject>
 
 /**
@@ -58,12 +63,12 @@
 /**
  *  The delegate to receive error: and message: callbacks
  */
-@property (nonatomic, weak) NSObject<SQLClientDelegate>* delegate;
+@property (nonatomic, weak, nullable) NSObject<SQLClientDelegate>* delegate;
 
 /**
  *  The queue for database operations. By default, uses a new queue called 'com.martinrybak.sqlclient' created upon singleon intialization. Can be overridden.
  */
-@property (nonatomic, strong) NSOperationQueue* workerQueue;
+@property (nonatomic, strong, nullable) NSOperationQueue* workerQueue;
 
 /**
  *  The queue for block callbacks. By default, uses the current queue upon singleton initialization. Can be overridden.
@@ -76,7 +81,7 @@
  To list all supported iconv character sets, open a Terminal window and enter:
  $ iconv --list
  */
-@property (nonatomic, copy) NSString* charset;
+@property (nonatomic, copy, nullable) NSString* charset;
 
 /**
  *  Returns an initialized SQLClient instance as a singleton
@@ -92,14 +97,13 @@
  *  @param username Required. The database username
  *  @param password Required. The database password
  *  @param database Required. The database name
- *  @param delegate Required. An NSObject that implements the SQLClientDelegate protocol for receiving error messages
  *  @param completion Block to be executed upon method successful connection
  */
 - (void)connect:(NSString*)host
        username:(NSString*)username
        password:(NSString*)password
        database:(NSString*)database
-     completion:(void (^)(BOOL success))completion;
+     completion:(nullable SQLConnectionSuccess)completion;
 
 /**
  *  Indicates whether the database is currently connected
@@ -110,9 +114,20 @@
  *  Executes a SQL statement. Results of queries will be passed to the completion handler. Inserts, updates, and deletes do not return results.
  *
  *  @param sql Required. A SQL statement
- *  @param completion Block to be executed upon method completion. Accepts an NSArray of tables. Each table is an NSArray of rows. Each row is an NSDictionary of columns where key = name and object = value as an NSString.
+ *  @param completion Block to be executed upon method completion. Can be nil. Accepts an NSArray of tables and the number of rows selected. Each table is an NSArray of rows. Each row is a NSDictionary of columns where key = name and object = value as an NSString.
  */
-- (void)execute:(NSString*)sql completion:(void (^)(NSArray* results))completion;
+- (void)executeReader:(NSString*)sql completion:(nullable SQLQueryResults)completion;
+
+- (void)executeScalar:(NSString*)sql completion:(SQLQueryResults)completion;
+
+/**
+ *  Executes a SQL statement. The number of affected rows will be passed to the completion handler. This method does not generate results.
+ 
+ *
+ *  @param sql Required. A SQL statement
+ *  @param completion Block to be executed upon method completion. Can be nil. Accepts an NSArray of tables and the number of rows selected. The NSArray of tables will be nil. The number of affected rows will be passed to the completion handler.
+ */
+- (void)executeNonQuery:(NSString*)sql completion:(nullable SQLQueryResults)completion;
 
 /**
  *  Disconnects from database server
@@ -120,3 +135,5 @@
 - (void)disconnect;
 
 @end
+
+NS_ASSUME_NONNULL_END

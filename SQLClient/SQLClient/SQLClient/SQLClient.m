@@ -89,7 +89,7 @@ struct COL
 	   username:(NSString*)username
 	   password:(NSString*)password
 	   database:(NSString*)database
-	 completion:(void (^)(BOOL success))completion
+	 completion:(SQLConnectionSuccess)completion
 {
 	//Save inputs
 	self.host = host;
@@ -142,9 +142,8 @@ struct COL
 	return !dbdead(connection);
 }
 
-// TODO: how to get number of records changed during update or delete
 // TODO: how to handle SQL stored procedure output parameters
-- (void)execute:(NSString*)sql completion:(void (^)(NSArray* results))completion
+- (void)executeReader:(NSString*)sql completion:(SQLQueryResults)completion
 {
 	//Execute query on worker queue
 	[self.workerQueue addOperationWithBlock:^{
@@ -152,12 +151,10 @@ struct COL
 		//Set query timeout
 		dbsettime(self.timeout);
 		
-		//Prepare SQL statement
-		dbcmd(connection, [sql UTF8String]);
-		
-		//Execute SQL statement
-		if (dbsqlexec(connection) == FAIL)
-			return [self executionFailure:completion];
+        //Execute SQL statement
+        if ([self executeSQLStatement:sql] == FAIL) {
+            return [self executionFailure:nil];
+        }
 		
 		//Create array to contain the tables
 		NSMutableArray* output = [[NSMutableArray alloc] init];
@@ -188,38 +185,10 @@ struct COL
 				//Get column number
 				int c = pcol - columns + 1;
 				
-				//Get column metadata
-				pcol->name = dbcolname(connection, c);
-				pcol->type = dbcoltype(connection, c);
-                
-                //For IMAGE data, we need to multiply by 2, because dbbind() will convert each byte to a hexadecimal pair.
-                //http://www.freetds.org/userguide/samplecode.htm#SAMPLECODE.RESULTS
-                if(pcol->type == SYBIMAGE){
-                    pcol->size = dbcollen(connection, c) * 2;
-                }else{
-                    pcol->size = dbcollen(connection, c);
-                }
-
-				
-				//If the column is [VAR]CHAR or TEXT, we want the column's defined size, otherwise we want
-				//its maximum size when represented as a string, which FreeTDS's dbwillconvert()
-				//returns (for fixed-length datatypes). We also do not need to convert IMAGE data type
-				if (pcol->type != SYBCHAR && pcol->type != SYBTEXT && pcol->type != SYBIMAGE)
-					pcol->size = dbwillconvert(pcol->type, SYBCHAR);
-				
-				//Allocate memory in the current pcol struct for a buffer
-				if ((pcol->buffer = calloc(1, pcol->size + 1)) == NULL)
-					return [self executionFailure:completion];
-				
-				//Bind column name
-				erc = dbbind(connection, c, NTBSTRINGBIND, pcol->size + 1, (BYTE*)pcol->buffer);
-				if (erc == FAIL)
-					return [self executionFailure:completion];
-				
-				//Bind column status
-				erc = dbnullbind(connection, c, &pcol->status);
-				if (erc == FAIL)
-					return [self executionFailure:completion];
+                //Assign metada to column
+                erc = [self assignMetadaToColumn:pcol forIndex:c];
+                if (erc == FAIL)
+                    return [self executionFailure:completion];
 				
 				//printf("%s is type %d with value %s\n", pcol->name, pcol->type, pcol->buffer);
 			}
@@ -229,61 +198,29 @@ struct COL
 			//Loop through each row
 			while ((row_code = dbnextrow(connection)) != NO_MORE_ROWS)
 			{
-				//Check row type
-				switch (row_code)
-				{
-					//Regular row
-					case REG_ROW:
-					{
-						//Create a new dictionary to contain the column names and vaues
-						NSMutableDictionary* row = [[NSMutableDictionary alloc] initWithCapacity:ncols];
-						
-						//Loop through each column and create an entry where dictionary[columnName] = columnValue
-						for (pcol = columns; pcol - columns < ncols; pcol++)
-						{
-							NSString* column = [NSString stringWithUTF8String:pcol->name];
-							id value;
-							if (pcol->status == -1) { //null value
-								value = [NSNull null];
-                                
-                            //Converting hexadecimal buffer into UIImage
-                            }else if (pcol ->type == SYBIMAGE){
-                                NSString *hexString = [[NSString stringWithUTF8String:pcol->buffer] stringByReplacingOccurrencesOfString:@" " withString:@""];
-                                NSMutableData *hexData = [[NSMutableData alloc] init];
-                                
-                                //Converting hex string to NSData
-                                unsigned char whole_byte;
-                                char byte_chars[3] = {'\0','\0','\0'};
-                                int i;
-                                for (i=0; i < [hexString length]/2; i++) {
-                                    byte_chars[0] = [hexString characterAtIndex:i*2];
-                                    byte_chars[1] = [hexString characterAtIndex:i*2+1];
-                                    whole_byte = strtol(byte_chars, NULL, 16);
-                                    [hexData appendBytes:&whole_byte length:1];
-                                }
-                                value = [UIImage imageWithData:hexData];
-                            }else {
-								value = [NSString stringWithUTF8String:pcol->buffer];
-							}
-							//id value = [NSString stringWithUTF8String:pcol->buffer] ?: [NSNull null];
-							row[column] = value;
-                            //printf("%@=%@\n", column, value);
-						}
+                //Check row type
+                switch (row_code)
+                {
+                        //Regular row
+                    case REG_ROW:
+                    {
+                        //Create a new dictionary to contain the column names and values
+                        NSMutableDictionary* row = [self createRowFromColumns:columns totalOfColumns:ncols];
                         
                         //Add an immutable copy to the table
-						[table addObject:[row copy]];
-						//printf("\n");
-						break;
-					}
-					//Buffer full
-					case BUF_FULL:
-						return [self executionFailure:completion];
-					//Error
-					case FAIL:
-						return [self executionFailure:completion];
-					default:
-						[self message:SQLClientRowIgnoreMessage];
-				}
+                        [table addObject:[row copy]];
+                        //printf("\n");
+                        break;
+                    }
+                        //Buffer full
+                    case BUF_FULL:
+                        return [self executionFailure:completion];
+                        //Error
+                    case FAIL:
+                        return [self executionFailure:completion];
+                    default:
+                        [self message:SQLClientRowIgnoreMessage];
+                }
 			}
 			
 			//Clean up
@@ -295,9 +232,110 @@ struct COL
 			[output addObject:[table copy]];
 		}
 		
+        DBINT rowsAffected = dbcount(connection);
+        
         //Success! Send an immutable copy of the results array
-		[self executionSuccess:completion results:[output copy]];
+		[self executionSuccess:completion results:[output copy] rowsAffected:rowsAffected];
 	}];
+}
+
+- (void)executeScalar:(NSString*)sql completion:(SQLQueryResults)completion
+{
+    //Execute query on worker queue
+    [self.workerQueue addOperationWithBlock:^{
+        
+        //Set query timeout
+        dbsettime(self.timeout);
+        
+        //Execute SQL statement
+        if ([self executeSQLStatement:sql] == FAIL) {
+            return [self executionFailure:nil];
+        }
+        
+        //Create array to contain the tables
+        NSMutableArray* output = [[NSMutableArray alloc] init];
+        
+        struct COL* pcol;
+        int erc;
+        
+        //Loop through each table
+        if ((erc = dbresults(connection)) != NO_MORE_RESULTS)
+        {
+            int row_code;
+            
+            //Create array to contain the rows for this table
+            NSMutableArray* table = [[NSMutableArray alloc] init];
+            
+            //Allocate C-style array of COL structs
+            if ((pcol = calloc(1, sizeof(struct COL))) == NULL)
+                return [self executionFailure:completion];
+            
+            //Assign metada to column
+            erc = [self assignMetadaToColumn:pcol forIndex:1];
+            if (erc == FAIL)
+                return [self executionFailure:completion];
+            
+            //printf("\n");
+            
+            //Loop through each row
+            if ((row_code = dbnextrow(connection)) != NO_MORE_ROWS)
+            {
+                //Check row type
+                switch (row_code)
+                {
+                        //Regular row
+                    case REG_ROW:
+                    {
+                        //Create a new dictionary to contain the column names and values
+                        NSMutableDictionary* row = [self createRowFromColumns:pcol totalOfColumns:1];
+                        
+                        //Add an immutable copy to the table
+                        [table addObject:[row copy]];
+                        //printf("\n");
+                        break;
+                    }
+                        //Buffer full
+                    case BUF_FULL:
+                        return [self executionFailure:completion];
+                        //Error
+                    case FAIL:
+                        return [self executionFailure:completion];
+                    default:
+                        [self message:SQLClientRowIgnoreMessage];
+                }
+            }
+            
+            //Clean up
+            free(pcol->buffer);
+            
+            //Add immutable copy of table to output
+            [output addObject:[table copy]];
+        }
+        
+        DBINT rowsAffected = dbcount(connection);
+        
+        if (rowsAffected > 1)
+            rowsAffected = 1;
+        
+        //Success! Send an immutable copy of the results array
+        [self executionSuccess:completion results:[output copy] rowsAffected:rowsAffected];
+    }];
+}
+
+- (void)executeNonQuery:(NSString*)sql completion:(SQLQueryResults)completion
+{
+    //Execute query on worker queue
+    [self.workerQueue addOperationWithBlock:^{
+        
+        //Execute SQL statement
+        if ([self executeSQLStatement:sql] == FAIL)
+            return [self executionFailure:nil];
+        
+        DBINT rowsAffected = dbcount(connection);
+        
+        //Success! Send affected rows of query
+        [self executionSuccess:completion results:nil rowsAffected:rowsAffected];
+    }];
 }
 
 - (void)disconnect
@@ -307,8 +345,105 @@ struct COL
 
 #pragma mark - Private
 
+//Execute SQL statement
+- (int)executeSQLStatement:(NSString*)sql
+{
+    //Prepare SQL statement
+    if (dbcmd(connection, [sql UTF8String]) == FAIL)
+        return FAIL;
+    
+    //Execute SQL statement
+    if (dbsqlexec(connection) == FAIL)
+        return FAIL;
+    
+    return SUCCEED;
+}
+
+//Retrieves column metadata from database
+- (int)assignMetadaToColumn:(struct COL *)column forIndex:(int)index
+{
+    int erc;
+    
+    //Get column metadata
+    column->name = dbcolname(connection, index);
+    column->type = dbcoltype(connection, index);
+    
+    //For IMAGE data, we need to multiply by 2, because dbbind() will convert each byte to a hexadecimal pair.
+    //http://www.freetds.org/userguide/samplecode.htm#SAMPLECODE.RESULTS
+    if(column->type == SYBIMAGE){
+        column->size = dbcollen(connection, index) * 2;
+    }else{
+        column->size = dbcollen(connection, index);
+    }
+    
+    //If the column is [VAR]CHAR or TEXT, we want the column's defined size, otherwise we want
+    //its maximum size when represented as a string, which FreeTDS's dbwillconvert()
+    //returns (for fixed-length datatypes). We also do not need to convert IMAGE data type
+    if (column->type != SYBCHAR && column->type != SYBTEXT && column->type != SYBIMAGE)
+        column->size = dbwillconvert(column->type, SYBCHAR);
+    
+    //Allocate memory in the current pcol struct for a buffer
+    if ((column->buffer = calloc(1, column->size + 1)) == NULL)
+        return FAIL;
+    
+    //Bind column name
+    erc = dbbind(connection, index, NTBSTRINGBIND, column->size + 1, (BYTE*)column->buffer);
+    if (erc == FAIL)
+        return FAIL;
+    
+    //Bind column status
+    erc = dbnullbind(connection, index, &column->status);
+    if (erc == FAIL)
+        return FAIL;
+    
+    return SUCCEED;
+}
+
+//Generate a row table from columns data
+- (NSMutableDictionary *)createRowFromColumns:(struct COL*)columns totalOfColumns:(int)total
+{
+    struct COL* pcol;
+    
+    //Create a new dictionary to contain the column names and values
+    NSMutableDictionary* row = [[NSMutableDictionary alloc] initWithCapacity:total];
+    
+    //Loop through each column and create an entry where dictionary[columnName] = columnValue
+    for (pcol = columns; pcol - columns < total; pcol++)
+    {
+        NSString* column = [NSString stringWithUTF8String:pcol->name];
+        
+        id value;
+        if (pcol->status == -1) { //null value
+            value = [NSNull null];
+            
+            //Converting hexadecimal buffer into NSImage
+        }else if (pcol->type == SYBIMAGE){
+            NSString *hexString = [[NSString stringWithUTF8String:pcol->buffer] stringByReplacingOccurrencesOfString:@" " withString:@""];
+            NSMutableData *hexData = [[NSMutableData alloc] init];
+            
+            //Converting hex string to NSData
+            unsigned char whole_byte;
+            char byte_chars[3] = {'\0','\0','\0'};
+            int i;
+            for (i=0; i < [hexString length]/2; i++) {
+                byte_chars[0] = [hexString characterAtIndex:i*2];
+                byte_chars[1] = [hexString characterAtIndex:i*2+1];
+                whole_byte = strtol(byte_chars, NULL, 16);
+                [hexData appendBytes:&whole_byte length:1];
+            }
+            value = [[UIImage alloc] initWithData:hexData];
+        }else {
+            value = [NSString stringWithUTF8String:pcol->buffer];
+        }
+        
+        row[column] = value;
+    }
+    
+    return row;
+}
+
 //Invokes connection completion handler on callback queue with success = NO
-- (void)connectionFailure:(void (^)(BOOL success))completion
+- (void)connectionFailure:(SQLConnectionSuccess)completion
 {
     [self.callbackQueue addOperationWithBlock:^{
         if (completion)
@@ -321,7 +456,7 @@ struct COL
 }
 
 //Invokes connection completion handler on callback queue with success = [self connected]
-- (void)connectionSuccess:(void (^)(BOOL success))completion
+- (void)connectionSuccess:(SQLConnectionSuccess)completion
 {
     [self.callbackQueue addOperationWithBlock:^{
         if (completion)
@@ -334,11 +469,11 @@ struct COL
 }
 
 //Invokes execution completion handler on callback queue with results = nil
-- (void)executionFailure:(void (^)(NSArray* results))completion
+- (void)executionFailure:(SQLQueryResults)completion
 {
     [self.callbackQueue addOperationWithBlock:^{
         if (completion)
-            completion(nil);
+            completion(nil, -1);
     }];
     
     //Clean up
@@ -346,11 +481,11 @@ struct COL
 }
 
 //Invokes execution completion handler on callback queue with results array
-- (void)executionSuccess:(void (^)(NSArray* results))completion results:(NSArray*)results
+- (void)executionSuccess:(SQLQueryResults)completion results:(NSArray*)results rowsAffected:(int)rowsAffected
 {
     [self.callbackQueue addOperationWithBlock:^{
         if (completion)
-            completion(results);
+            completion(results, rowsAffected);
     }];
     
     //Clean up
